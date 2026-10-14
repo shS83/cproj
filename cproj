@@ -4,7 +4,7 @@
 # Source shell/cproj.bash in your shell to actually change directories.
 set -o pipefail
 
-VERSION='0.1.0'
+VERSION='0.1.1'
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cproj"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cproj"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cproj"
@@ -18,6 +18,7 @@ CPROJ_ROOTS=("$HOME/Code" '/Tools')
 CPROJ_MAX_DEPTH=5
 CPROJ_CACHE_TTL=3600
 CPROJ_PREVIEW_LINES=10
+CPROJ_AUTO_VENV=1
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 # Save stdout for machine-readable paths. All decoration goes to fzf/terminal.
@@ -32,6 +33,7 @@ validate_config() {
     [[ $CPROJ_CACHE_TTL =~ ^[0-9]+$ ]] || die 'CPROJ_CACHE_TTL must be a nonnegative number.'
     [[ $CPROJ_PREVIEW_LINES =~ ^[1-9][0-9]?$ ]] || die 'CPROJ_PREVIEW_LINES must be between 1 and 99.'
     [[ ${#CPROJ_ROOTS[@]} -gt 0 ]] || die 'CPROJ_ROOTS must be a nonempty Bash array.'
+    [[ $CPROJ_AUTO_VENV == 0 || $CPROJ_AUTO_VENV == 1 ]] || die 'CPROJ_AUTO_VENV must be 0 or 1.'
 }
 
 # fzf records are tab separated and history/index use newline separated paths.
@@ -211,8 +213,10 @@ preview() {
     printf '%s%s%s\n' "$cyan" "${p##*/}" "$reset"
     printf '%s%s%s\n' "$dim" "$p" "$reset"
     printf '\n%sTYPE%s  %s\n' "$uv" "$reset" "$(project_kind "$p")"
-    if [[ -d "$p/.venv" ]]; then
-        printf '%sENV%s   .venv detected\n' "$uv" "$reset"
+    if [[ -f "$p/.venv/bin/activate" ]]; then
+        printf '%sENV%s   .venv ready (auto-activation: %s)\n' "$uv" "$reset" "$([[ $CPROJ_AUTO_VENV == 1 ]] && printf on || printf off)"
+    elif [[ -d "$p/.venv" ]]; then
+        printf '%sENV%s   .venv found (missing bin/activate)\n' "$uv" "$reset"
     elif [[ -f "$p/uv.lock" ]]; then
         printf '%sENV%s   uv.lock detected\n' "$uv" "$reset"
     fi
@@ -260,7 +264,7 @@ fzf_picker() {
             printf '\033[38;2;183;150;255m✦\033[0m %-28s\t%s\n' "$name" "$p"
         done | fzf --ansi --delimiter=$'\t' --with-nth=1,2 \
             --height='95%' --min-height=15 --layout=reverse \
-            --border=rounded --border-label=' ◈ CPROJ / PROJECT TELEPORTER v0.1.0 ' \
+            --border=rounded --border-label=' ◈ CPROJ / PROJECT TELEPORTER v0.1.1 ' \
             --prompt='⌁ teleport › ' --pointer='❯' --marker='◆' \
             --header='ENTER teleport  ·  ESC cancel  ·  PREVIEW: Git / README / environment' \
             --preview="$preview_cmd" \
@@ -275,7 +279,7 @@ fzf_picker() {
 
 help() {
     cat <<'HELP'
-CPROJ - Promethean Project Teleporter v0.1.0
+CPROJ - Promethean Project Teleporter v0.1.1
 
 USAGE
   cproj                       Interactive project navigator (fzf)
@@ -297,10 +301,12 @@ CONFIGURATION
   CPROJ_ROOTS=("$HOME/Code" "/Tools")
   CPROJ_MAX_DEPTH=5
   CPROJ_CACHE_TTL=3600
+  CPROJ_AUTO_VENV=1     # Activate .venv when changing projects (0=disabled)
 
 IMPORTANT
   The executable returns the selected directory on stdout. To actually
-  change directories, source cproj.bash in ~/.bashrc (see README.md).
+  change directories and automatically switch .venv environments, source
+  cproj.bash in ~/.bashrc (see README.md).
   CPROJ uses Bash and fzf. Paths containing tabs/newlines are not indexed.
 HELP
 }

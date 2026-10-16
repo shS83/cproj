@@ -56,7 +56,7 @@ _cproj_sync_venv() {
 
 cproj() {
     case ${1:-} in
-        --help|-h|--version|-V|--list|--refresh|--add|--config)
+        --help|-h|--version|-V|--list|--status|--refresh|--add|--config)
             command cproj "$@"
             return $?
             ;;

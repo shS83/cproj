@@ -4,7 +4,7 @@
 # Source shell/cproj.bash in your shell to actually change directories.
 set -o pipefail
 
-VERSION='0.1.1'
+VERSION='0.2.0'
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cproj"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cproj"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cproj"
@@ -190,6 +190,73 @@ name_match() {
     fi
 }
 
+# A NUL-delimited status keeps filenames with newlines and renames accurate.
+# Return 2 for non-Git projects, 1 for an unreadable repository.
+git_snapshot() {
+    local p=$1 output entry
+    GIT_CHANGES=0
+    GIT_BRANCH=''
+    GIT_SYNC='no upstream'
+    git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 2
+    output=$(mktemp "$CACHE_DIR/.status.XXXXXXXX") || return 1
+    if ! git -C "$p" status --porcelain=v1 -z --untracked-files=all > "$output"; then
+        rm -f -- "$output"
+        return 1
+    fi
+    while IFS= read -r -d '' entry; do
+        ((++GIT_CHANGES))
+        # Renames/copies contain an additional source-path record.
+        if [[ ${entry:0:2} == *R* || ${entry:0:2} == *C* ]]; then
+            IFS= read -r -d '' entry || true
+        fi
+    done < "$output"
+    rm -f -- "$output"
+    GIT_BRANCH=$(git -C "$p" symbolic-ref --short -q HEAD 2>/dev/null || printf 'detached HEAD')
+    local counts ahead behind
+    if counts=$(git -C "$p" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null); then
+        read -r ahead behind <<< "$counts"
+        GIT_SYNC="ahead $ahead / behind $behind"
+    fi
+}
+
+project_status() {
+    command -v git >/dev/null 2>&1 || die 'git not found. Install Git to inspect project status.'
+    ensure_index
+    local p state rc failed=0 count=0
+    local GIT_CHANGES GIT_BRANCH GIT_SYNC
+    local -a projects=(PROJECT) branches=(BRANCH) worktrees=(WORKTREE) upstreams=(UPSTREAM)
+    local project_width=7 branch_width=6 worktree_width=8 i
+    while IFS= read -r p; do
+        valid_path "$p" || continue
+        if git_snapshot "$p"; then
+            ((++count))
+            state=clean
+            ((GIT_CHANGES)) && state="$GIT_CHANGES changed/untracked file(s)"
+            projects+=("$p")
+            branches+=("$GIT_BRANCH")
+            worktrees+=("$state")
+            upstreams+=("$GIT_SYNC")
+            ((${#p} > project_width)) && project_width=${#p}
+            ((${#GIT_BRANCH} > branch_width)) && branch_width=${#GIT_BRANCH}
+            ((${#state} > worktree_width)) && worktree_width=${#state}
+        else
+            rc=$?
+            if ((rc != 2)); then
+                warn "Cannot read Git status: $p"
+                failed=1
+            fi
+        fi
+    done < "$INDEX_FILE"
+    for ((i=0; i<${#projects[@]}; i++)); do
+        printf '%-*s  %-*s  %-*s  %s\n' \
+            "$project_width" "${projects[i]}" \
+            "$branch_width" "${branches[i]}" \
+            "$worktree_width" "${worktrees[i]}" "${upstreams[i]}"
+    done
+    ((count)) || warn 'No Git projects found.'
+    return "$failed"
+}
+
 project_kind() {
     local p=$1
     if [[ -f "$p/pyproject.toml" ]]; then printf 'Python';
@@ -245,7 +312,8 @@ preview() {
 
 fzf_picker() {
     command -v fzf >/dev/null 2>&1 || die 'fzf not found. Install with: sudo pacman -S fzf'
-    local mode=${1:-all} p name row selection preview_cmd
+    local mode=${1:-all} p name row selection preview_cmd rc
+    local GIT_CHANGES GIT_BRANCH GIT_SYNC
     local -a paths=()
     if [[ "$mode" == recent ]]; then
         [[ -f "$RECENT_FILE" ]] || die 'No recent projects yet.'
@@ -254,6 +322,23 @@ fzf_picker() {
         done < "$RECENT_FILE"
     else
         while IFS= read -r p; do paths+=("$p"); done < <(print_index)
+    fi
+    if [[ $mode == dirty ]]; then
+        command -v git >/dev/null 2>&1 || die 'git not found. Install Git to inspect project status.'
+        local -a dirty_paths=()
+        for p in "${paths[@]}"; do
+            if git_snapshot "$p"; then
+                ((GIT_CHANGES)) && dirty_paths+=("$p")
+            else
+                rc=$?
+                ((rc == 2)) || die "Cannot read Git status: $p"
+            fi
+        done
+        paths=("${dirty_paths[@]}")
+        if ((${#paths[@]} == 0)); then
+            warn 'No projects with uncommitted changes.'
+            return 1
+        fi
     fi
     ((${#paths[@]})) || die 'No projects found. Adjust CPROJ_ROOTS or use cproj --add DIRECTORY.'
     printf -v preview_cmd '%q' "$SELF"
@@ -264,7 +349,7 @@ fzf_picker() {
             printf '\033[38;2;183;150;255m✦\033[0m %-28s\t%s\n' "$name" "$p"
         done | fzf --ansi --delimiter=$'\t' --with-nth=1,2 \
             --height='95%' --min-height=15 --layout=reverse \
-            --border=rounded --border-label=' ◈ CPROJ / PROJECT TELEPORTER v0.1.1 ' \
+            --border=rounded --border-label=' ◈ CPROJ / PROJECT TELEPORTER v0.2.0 ' \
             --prompt='⌁ teleport › ' --pointer='❯' --marker='◆' \
             --header='ENTER teleport  ·  ESC cancel  ·  PREVIEW: Git / README / environment' \
             --preview="$preview_cmd" \
@@ -279,7 +364,7 @@ fzf_picker() {
 
 help() {
     cat <<'HELP'
-CPROJ - Promethean Project Teleporter v0.1.1
+CPROJ - Promethean Project Teleporter v0.2.0
 
 USAGE
   cproj                       Interactive project navigator (fzf)
@@ -287,6 +372,8 @@ USAGE
   cproj -                     Jump to the previously visited project
   cproj --recent              Browse previously visited projects
   cproj --list                List discovered project directories
+  cproj --status              Show Git worktree and upstream status for all projects
+  cproj --dirty               Browse projects with uncommitted changes
   cproj --add DIRECTORY       Add a directory manually
   cproj --refresh             Refresh the project index
   cproj --config              Show the configuration file path
@@ -316,6 +403,8 @@ main() {
         --help|-h) help ;;
         --version|-V) printf '%s\n' "$VERSION" ;;
         --list) validate_config; print_index ;;
+        --status) validate_config; project_status ;;
+        --dirty) validate_config; fzf_picker dirty ;;
         --refresh) refresh_index ;;
         --add) shift; add_manual "$@" ;;
         --config) printf '%s\n' "$CONFIG_FILE" ;;

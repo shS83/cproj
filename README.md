@@ -1,4 +1,4 @@
-# CPROJ — Promethean Project Teleporter v0.1.1
+# CPROJ — Promethean Project Teleporter v0.2.0
 
 A Bash-native project navigator for Arch Linux, with a colorful `fzf` interface,
 Git/README previews, recent-project history, shell-level directory changes, and automatic Python/uv `.venv` activation.
@@ -46,7 +46,7 @@ built-in `cd`, records the destination, and activates/deactivates an existing `.
 ## Usage
 
 ```text
-CPROJ - Promethean Project Teleporter v0.1.1
+CPROJ - Promethean Project Teleporter v0.2.0
 
 cproj                       Open the fzf project browser
 cproj nadar                 Jump directly to a project (case-insensitive)
@@ -54,6 +54,8 @@ cproj psy                   Jump if a partial name is unambiguous
 cproj -                     Return to previously visited project
 cproj --recent              Pick from recently visited projects
 cproj --list                Print discovered directories
+cproj --status              Show Git status across all projects
+cproj --dirty               Pick a project with uncommitted changes
 cproj --add /path/to/dir    Add an explicit project directory
 cproj --refresh             Rescan configured roots
 cproj --config              Print configuration path
@@ -145,6 +147,7 @@ from `.bashrc` as described above.
 ```bash
 bash tests/test-cproj.sh
 bash tests/test-venv.sh
+bash tests/test-status.sh
 bash -n cproj shell/cproj.bash install.sh
 ```
 
@@ -154,11 +157,24 @@ real Git repositories or `~/.bashrc`.
 
 ## Scope / roadmap
 
-**v0.1.1 includes** core discovery, direct jumps, fzf, a styled live preview,
-manual add, history, and config. Future versions may add Git ahead/behind,
-favorites, a multi-action palette, Kitty window
-shortcuts, and richer animated borders. These are **not yet implemented**.
+**v0.2.0 includes** core discovery, direct jumps, fzf, a styled live preview,
+manual add, history, automatic virtual environments, and cross-project Git status.
 
-The CPROJ binary communicates the chosen path over stdout, so scripts can
-call it; all status messages go to stderr to avoid accidentally mixing
+`cproj --status` prints an aligned summary of every indexed Git project:
+full path, branch, changed/untracked file count, and ahead/behind counts relative
+to its configured upstream. Non-Git projects are skipped. Repositories without
+an upstream (including new repositories without commits) show `no upstream`;
+detached checkouts show `detached HEAD`. Upstream counts use local references:
+CPROJ does not fetch or access the network. Run `git fetch` in a repository to
+update its remote-tracking information.
+
+`cproj --dirty` opens the usual picker with only projects containing staged,
+unstaged, conflicting, or untracked files. Ignored files and clean repositories
+with only unpushed commits are excluded. With no matching projects it reports
+that there are no uncommitted changes and leaves the shell directory and virtual
+environment untouched. Both commands require Git. Status checks include all
+untracked files, so scanning large working trees can take longer.
+
+Navigation commands communicate the chosen path over stdout, so scripts can
+call them; `--status` prints its report to stdout and diagnostics go to stderr to avoid accidentally mixing
 human-readable text with the selected directory.

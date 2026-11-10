@@ -190,71 +190,92 @@ name_match() {
     fi
 }
 
-# A NUL-delimited status keeps filenames with newlines and renames accurate.
-# Return 2 for non-Git projects, 1 for an unreadable repository.
-git_snapshot() {
-    local p=$1 output entry
-    GIT_CHANGES=0
-    GIT_BRANCH=''
-    GIT_SYNC='no upstream'
-    git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 2
-    output=$(mktemp "$CACHE_DIR/.status.XXXXXXXX") || return 1
-    if ! git -C "$p" status --porcelain=v1 -z --untracked-files=all > "$output"; then
-        rm -f -- "$output"
-        return 1
-    fi
-    while IFS= read -r -d '' entry; do
-        ((++GIT_CHANGES))
-        # Renames/copies contain an additional source-path record.
-        if [[ ${entry:0:2} == *R* || ${entry:0:2} == *C* ]]; then
-            IFS= read -r -d '' entry || true
-        fi
-    done < "$output"
-    rm -f -- "$output"
-    GIT_BRANCH=$(git -C "$p" symbolic-ref --short -q HEAD 2>/dev/null || printf 'detached HEAD')
-    local counts ahead behind
-    if counts=$(git -C "$p" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null); then
-        read -r ahead behind <<< "$counts"
-        GIT_SYNC="ahead $ahead / behind $behind"
-    fi
-}
-
-project_status() {
-    command -v git >/dev/null 2>&1 || die 'git not found. Install Git to inspect project status.'
+# Update each distinct Git repository rooted at a discovered CPROJ project.
+# Always fast-forward only; never stash, reset, merge or discard local changes.
+pull_all() {
+    local dry_run=0
+    case ${1:-} in
+        '') (($# == 0)) || die 'Usage: cproj --pull-all [--dry-run]' ;;
+        --dry-run) (($# == 1)) || die 'Usage: cproj --pull-all [--dry-run]'; dry_run=1 ;;
+        *) die 'Usage: cproj --pull-all [--dry-run]' ;;
+    esac
+    command -v git >/dev/null 2>&1 || die 'git is not installed.'
+    validate_config
     ensure_index
-    local p state rc failed=0 count=0
-    local GIT_CHANGES GIT_BRANCH GIT_SYNC
-    local -a projects=(PROJECT) branches=(BRANCH) worktrees=(WORKTREE) upstreams=(UPSTREAM)
-    local project_width=7 branch_width=6 worktree_width=8 i
+
+    local p root branch upstream before after result
+    local total=0 updated=0 current=0 skipped=0 failed=0 planned=0
+    local -A seen_repos=()
+    local -a paths=()
     while IFS= read -r p; do
-        valid_path "$p" || continue
-        if git_snapshot "$p"; then
-            ((++count))
-            state=clean
-            ((GIT_CHANGES)) && state="$GIT_CHANGES changed/untracked file(s)"
-            projects+=("$p")
-            branches+=("$GIT_BRANCH")
-            worktrees+=("$state")
-            upstreams+=("$GIT_SYNC")
-            ((${#p} > project_width)) && project_width=${#p}
-            ((${#GIT_BRANCH} > branch_width)) && branch_width=${#GIT_BRANCH}
-            ((${#state} > worktree_width)) && worktree_width=${#state}
-        else
-            rc=$?
-            if ((rc != 2)); then
-                warn "Cannot read Git status: $p"
-                failed=1
-            fi
-        fi
+        valid_path "$p" && paths+=("$p")
     done < "$INDEX_FILE"
-    for ((i=0; i<${#projects[@]}; i++)); do
-        printf '%-*s  %-*s  %-*s  %s\n' \
-            "$project_width" "${projects[i]}" \
-            "$branch_width" "${branches[i]}" \
-            "$worktree_width" "${worktrees[i]}" "${upstreams[i]}"
+
+    printf '\nCPROJ  /  GIT PULL ALL%s\n' "$([[ $dry_run == 1 ]] && printf '  [DRY RUN]' || true)"
+    printf '%s\n' '──────────────────────────────────────────────────'
+
+    for p in "${paths[@]}"; do
+        # An indexed project inside a repository must not pull its parent again.
+        root=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || continue
+        root=$(absolute_dir "$root") || continue
+        [[ $p == "$root" ]] || continue
+        [[ -v 'seen_repos[$root]' ]] && continue
+        seen_repos[$root]=1
+        ((++total))
+
+        branch=$(git -C "$p" symbolic-ref --quiet --short HEAD 2>/dev/null) || {
+            printf 'SKIP  %-24s detached HEAD\n' "${p##*/}"
+            ((++skipped)); continue
+        }
+        upstream=$(git -C "$p" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || {
+            printf 'SKIP  %-24s no tracking upstream (%s)\n' "${p##*/}" "$branch"
+            ((++skipped)); continue
+        }
+        # Git's porcelain output includes untracked files as well as edits.
+        result=$(git -C "$p" status --porcelain=v1 --untracked-files=all 2>/dev/null) || {
+            printf 'FAIL  %-24s cannot inspect worktree\n' "${p##*/}"
+            ((++failed)); continue
+        }
+        if [[ -n $result ]]; then
+            printf 'SKIP  %-24s local changes / untracked files\n' "${p##*/}"
+            ((++skipped)); continue
+        fi
+        if ((dry_run)); then
+            printf 'PLAN  %-24s git pull --ff-only (%s ← %s)\n' "${p##*/}" "$branch" "$upstream"
+            ((++planned)); continue
+        fi
+
+        before=$(git -C "$p" rev-parse HEAD 2>/dev/null) || {
+            printf 'FAIL  %-24s cannot read HEAD\n' "${p##*/}"
+            ((++failed)); continue
+        }
+        # No interactive credential prompts while processing many projects.
+        # Git respects existing SSH agent credentials and configured remotes.
+        if result=$(GIT_TERMINAL_PROMPT=0 git -C "$p" pull --ff-only 2>&1); then
+            after=$(git -C "$p" rev-parse HEAD 2>/dev/null) || after=''
+            if [[ $before == "$after" ]]; then
+                printf 'OK    %-24s already up to date\n' "${p##*/}"
+                ((++current))
+            else
+                printf 'UPD   %-24s %s → %s\n' "${p##*/}" "${before:0:8}" "${after:0:8}"
+                ((++updated))
+            fi
+        else
+            printf 'FAIL  %-24s git pull --ff-only failed\n' "${p##*/}"
+            # Show the cause, but do not stop processing the remaining projects.
+            printf '%s\n' "$result" | sed -n '1,8s/^/      /p'
+            ((++failed))
+        fi
     done
-    ((count)) || warn 'No Git projects found.'
-    return "$failed"
+
+    printf '%s\n' '──────────────────────────────────────────────────'
+    if ((dry_run)); then
+        printf 'Repos: %s  planned: %s  skipped: %s  errors: %s\n' "$total" "$planned" "$skipped" "$failed"
+    else
+        printf 'Repos: %s  updated: %s  current: %s  skipped: %s  errors: %s\n' \
+            "$total" "$updated" "$current" "$skipped" "$failed"
+    fi
+    ((failed == 0))
 }
 
 project_kind() {
@@ -312,8 +333,7 @@ preview() {
 
 fzf_picker() {
     command -v fzf >/dev/null 2>&1 || die 'fzf not found. Install with: sudo pacman -S fzf'
-    local mode=${1:-all} p name row selection preview_cmd rc
-    local GIT_CHANGES GIT_BRANCH GIT_SYNC
+    local mode=${1:-all} p name row selection preview_cmd
     local -a paths=()
     if [[ "$mode" == recent ]]; then
         [[ -f "$RECENT_FILE" ]] || die 'No recent projects yet.'
@@ -322,23 +342,6 @@ fzf_picker() {
         done < "$RECENT_FILE"
     else
         while IFS= read -r p; do paths+=("$p"); done < <(print_index)
-    fi
-    if [[ $mode == dirty ]]; then
-        command -v git >/dev/null 2>&1 || die 'git not found. Install Git to inspect project status.'
-        local -a dirty_paths=()
-        for p in "${paths[@]}"; do
-            if git_snapshot "$p"; then
-                ((GIT_CHANGES)) && dirty_paths+=("$p")
-            else
-                rc=$?
-                ((rc == 2)) || die "Cannot read Git status: $p"
-            fi
-        done
-        paths=("${dirty_paths[@]}")
-        if ((${#paths[@]} == 0)); then
-            warn 'No projects with uncommitted changes.'
-            return 1
-        fi
     fi
     ((${#paths[@]})) || die 'No projects found. Adjust CPROJ_ROOTS or use cproj --add DIRECTORY.'
     printf -v preview_cmd '%q' "$SELF"
@@ -372,10 +375,10 @@ USAGE
   cproj -                     Jump to the previously visited project
   cproj --recent              Browse previously visited projects
   cproj --list                List discovered project directories
-  cproj --status              Show Git worktree and upstream status for all projects
-  cproj --dirty               Browse projects with uncommitted changes
   cproj --add DIRECTORY       Add a directory manually
   cproj --refresh             Refresh the project index
+  cproj --pull-all            Fast-forward all clean Git projects
+  cproj --pull-all --dry-run  Preview which projects would be pulled
   cproj --config              Show the configuration file path
   cproj --help                Show help
   cproj --version             Show version
@@ -390,6 +393,11 @@ CONFIGURATION
   CPROJ_CACHE_TTL=3600
   CPROJ_AUTO_VENV=1     # Activate .venv when changing projects (0=disabled)
 
+PULL ALL
+  Processes indexed Git repository roots only; ignores nested project paths.
+  Skips detached HEAD, missing upstream, and dirty worktrees.
+  Uses git pull --ff-only and continues on individual failures.
+
 IMPORTANT
   The executable returns the selected directory on stdout. To actually
   change directories and automatically switch .venv environments, source
@@ -403,9 +411,8 @@ main() {
         --help|-h) help ;;
         --version|-V) printf '%s\n' "$VERSION" ;;
         --list) validate_config; print_index ;;
-        --status) validate_config; project_status ;;
-        --dirty) validate_config; fzf_picker dirty ;;
         --refresh) refresh_index ;;
+        --pull-all) shift; pull_all "$@" ;;
         --add) shift; add_manual "$@" ;;
         --config) printf '%s\n' "$CONFIG_FILE" ;;
         --record) shift; record_recent "$@" ;;
